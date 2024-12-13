@@ -273,36 +273,40 @@ func (cs *Stream) thread(ctx context.Context, sl *structures.SlackLink, callback
 // sends the thread request on threadC.  It returns thread count in the mm and
 // error if any.
 func procChanMsg(ctx context.Context, proc processor.Conversations, threadC chan<- request, channel *slack.Channel, isLast bool, mm []slack.Message) (int, error) {
-	lg := slog.With("channel_id", channel.ID, "is_last", isLast, "msg_count", len(mm))
+    lg := slog.With("channel_id", channel.ID, "is_last", isLast, "msg_count", len(mm))
 
-	var trs = make([]request, 0, len(mm))
-	for i := range mm {
-		// collecting threads to get their count.  But we don't start
-		// processing them yet, before we send the messages with the number of
-		// "expected" threads to processor, to ensure that processor will
-		// start processing the channel and will have the initial reference
-		// count, if it needs it.
-		if mm[i].Msg.ThreadTimestamp != "" && mm[i].Msg.SubType != structures.SubTypeThreadBroadcast && mm[i].LatestReply != structures.LatestReplyNoReplies {
-			lg.DebugContext(ctx, "- message", "i", i, "thread", mm[i].Timestamp, "thread_ts", mm[i].Msg.ThreadTimestamp)
-			trs = append(trs, request{
-				sl: &structures.SlackLink{
-					Channel:  channel.ID,
-					ThreadTS: mm[i].Msg.ThreadTimestamp,
-				},
-			})
-		}
-		if err := procFiles(ctx, proc, channel, mm[i]); err != nil {
-			return len(trs), err
-		}
-	}
-	if err := proc.Messages(ctx, channel.ID, len(trs), isLast, mm); err != nil {
-		return 0, fmt.Errorf("failed to process message chunk starting with id=%s (size=%d): %w", mm[0].Msg.Timestamp, len(mm), err)
-	}
-	for _, tr := range trs {
-		threadC <- tr
-	}
-	return len(trs), nil
+    if len(mm) == 0 {
+        lg.WarnContext(ctx, "no messages received from Slack API for this channel")
+        return 0, nil
+    }
+
+    var trs = make([]request, 0, len(mm))
+    for i := range mm {
+        if mm[i].Msg.ThreadTimestamp != "" && mm[i].Msg.SubType != structures.SubTypeThreadBroadcast && mm[i].LatestReply != structures.LatestReplyNoReplies {
+            lg.DebugContext(ctx, "- message", "i", i, "thread", mm[i].Timestamp, "thread_ts", mm[i].Msg.ThreadTimestamp)
+            trs = append(trs, request{
+                sl: &structures.SlackLink{
+                    Channel:  channel.ID,
+                    ThreadTS: mm[i].Msg.ThreadTimestamp,
+                },
+            })
+        }
+        if err := procFiles(ctx, proc, channel, mm[i]); err != nil {
+            return len(trs), fmt.Errorf("error processing files: %w", err)
+        }
+    }
+
+    if err := proc.Messages(ctx, channel.ID, len(trs), isLast, mm); err != nil {
+        lg.ErrorContext(ctx, "error processing message chunk", "error", err)
+        return 0, fmt.Errorf("failed to process message chunk for channel %s (size=%d): %w", channel.ID, len(mm), err)
+    }
+
+    for _, tr := range trs {
+        threadC <- tr
+    }
+    return len(trs), nil
 }
+
 
 func procThreadMsg(ctx context.Context, proc processor.Conversations, channel *slack.Channel, threadTS string, threadOnly bool, isLast bool, msgs []slack.Message) error {
 	// extract files from thread messages
